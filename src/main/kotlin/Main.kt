@@ -5,7 +5,10 @@ import java.io.File
 import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.util.UUID
-import kotlin.math.max
+
+// =========================
+// CONFIG
+// =========================
 
 const val MODEL_PATH = "/data/data/com.termux/files/home/storage/downloads/gemma-4-E2B-it.litertlm"
 const val LITERT_BIN = "/data/data/com.termux/files/home/litert/litert_lm_main"
@@ -31,6 +34,10 @@ fun main() {
     println("Using model path: $MODEL_PATH")
     println("Model implementation: ${model::class.simpleName}")
 }
+
+// =========================
+// HTTP HANDLERS
+// =========================
 
 class HealthHandler(private val model: LocalModel) : HttpHandler {
     override fun handle(exchange: HttpExchange) {
@@ -74,33 +81,24 @@ class MessagesHandler(private val model: LocalModel) : HttpHandler {
             val modelName = extractTopLevelString(body, "model") ?: "local-gemma"
             val maxTokens = extractTopLevelInt(body, "max_tokens") ?: 512
             val temperature = extractTopLevelDouble(body, "temperature") ?: 0.2
-            val messages = extractMessages(body)
 
-            logRequestSummary(
-                modelName = modelName,
-                systemPrompt = systemPrompt,
-                messages = messages,
+            val messages = extractMessages(body)
+            val prompt = buildPrompt(systemPrompt, messages)
+
+            println(
+                "[REQ] model=$modelName max_tokens=$maxTokens temp=$temperature " +
+                    "system=${if (systemPrompt.isNullOrBlank()) "<none>" else "<present>"} " +
+                    "messages=${messages.size} preview=" +
+                    messages.joinToString(" | ") { "${it.role}:${it.content.take(120)}" }
+            )
+
+            val answer = model.generate(
+                prompt = prompt,
                 maxTokens = maxTokens,
                 temperature = temperature
             )
 
-            val prompt = buildPrompt(systemPrompt, messages)
-
-            val answer = if (isTitleRequest(modelName, systemPrompt, messages)) {
-                println("[REQ] detected title request")
-                buildTitleJson(messages)
-            } else {
-                model.generate(
-                    prompt = prompt,
-                    maxTokens = maxTokens,
-                    temperature = temperature
-                )
-            }
-
-            logResponseSummary(answer)
-
-            val inputTokens = estimateTokenCount(prompt)
-            val outputTokens = estimateTokenCount(answer)
+            println("[RES] chars=${answer.length} preview=${answer.take(300)}")
 
             val responseJson = """
                 {
@@ -114,12 +112,7 @@ class MessagesHandler(private val model: LocalModel) : HttpHandler {
                       "text": ${jsonString(answer)}
                     }
                   ],
-                  "stop_reason": "end_turn",
-                  "stop_sequence": null,
-                  "usage": {
-                    "input_tokens": $inputTokens,
-                    "output_tokens": $outputTokens
-                  }
+                  "stop_reason": "end_turn"
                 }
             """.trimIndent()
 
@@ -135,10 +128,15 @@ class MessagesHandler(private val model: LocalModel) : HttpHandler {
                   }
                 }
             """.trimIndent()
+
             sendJson(exchange, 500, errorJson)
         }
     }
 }
+
+// =========================
+// MODEL INTERFACE
+// =========================
 
 interface LocalModel {
     fun isReady(): Boolean
@@ -182,49 +180,51 @@ class CliLocalModel(
             throw IllegalStateException("litert_lm_main failed with exit code $exitCode:\n$output")
         }
 
-        return extractModelAnswer(rawOutput = output, prompt = prompt)
+        val cleaned = extractModelAnswer(output)
+        return if (cleaned.length > 4000) cleaned.take(4000) else cleaned
     }
 
-    private fun extractModelAnswer(rawOutput: String, prompt: String): String {
-        var text = rawOutput
+    private fun extractModelAnswer(rawOutput: String): String {
+        val lines = rawOutput.lines()
 
-        val promptLineIndex = text.indexOf("input_prompt:")
-        if (promptLineIndex != -1) {
-            val afterPromptHeader = text.indexOf('\n', promptLineIndex)
-            if (afterPromptHeader != -1) {
-                text = text.substring(afterPromptHeader + 1)
-            }
+        val promptIndex = lines.indexOfFirst { it.startsWith("input_prompt:") }
+        val candidateLines = if (promptIndex != -1 && promptIndex + 1 < lines.size) {
+            lines.drop(promptIndex + 1)
+        } else {
+            lines
         }
 
-        text = text
-            .lines()
+        val startIndex = candidateLines.indexOfFirst { line ->
+            val trimmed = line.trimStart()
+            trimmed.startsWith("Voici ") ||
+                trimmed.startsWith("Bien sûr") ||
+                trimmed.startsWith("D'accord") ||
+                trimmed.startsWith("fun ") ||
+                trimmed.startsWith("```") ||
+                trimmed.startsWith("Pour ") ||
+                trimmed.startsWith("Étape 1") ||
+                trimmed.startsWith("1.")
+        }
+
+        val usefulLines = if (startIndex != -1) {
+            candidateLines.drop(startIndex)
+        } else {
+            candidateLines
+        }
+
+        return usefulLines
+            .takeWhile { !it.startsWith("BenchmarkInfo:") }
             .filterNot { it.startsWith("VERBOSE:") }
             .filterNot { it.startsWith("INFO:") }
             .filterNot { it.startsWith("WARNING:") }
-            .takeWhile { !it.startsWith("BenchmarkInfo:") }
             .joinToString("\n")
             .trim()
-
-        val normalizedPrompt = prompt.trim()
-        if (text.startsWith(normalizedPrompt)) {
-            text = text.removePrefix(normalizedPrompt).trimStart()
-        }
-
-        if (text.startsWith("Assistant:\n")) {
-            text = text.removePrefix("Assistant:\n").trimStart()
-        } else if (text.startsWith("Assistant:")) {
-            text = text.removePrefix("Assistant:").trimStart()
-        }
-
-        val assistantMarker = "\nAssistant:\n"
-        val assistantIdx = text.lastIndexOf(assistantMarker)
-        if (assistantIdx != -1) {
-            text = text.substring(assistantIdx + assistantMarker.length).trimStart()
-        }
-
-        return sanitizeAssistantTurn(text)
     }
 }
+
+// =========================
+// REQUEST PARSING
+// =========================
 
 data class ChatMessage(
     val role: String,
@@ -244,8 +244,8 @@ fun extractMessages(json: String): List<ChatMessage> {
     if (arrayEnd == -1) return result
 
     val arrayBody = json.substring(arrayStart + 1, arrayEnd)
-    val objects = splitTopLevelObjects(arrayBody)
 
+    val objects = splitTopLevelObjects(arrayBody)
     for (obj in objects) {
         val role = extractTopLevelString(obj, "role") ?: "user"
         val content = extractContentField(obj)
@@ -435,8 +435,26 @@ fun unescapeJson(input: String): String {
     return sb.toString()
 }
 
+// =========================
+// PROMPT BUILDING
+// =========================
+
 fun buildPrompt(system: String?, messages: List<ChatMessage>): String {
     val sb = StringBuilder()
+
+    sb.append(
+        """
+        System:
+        You are a coding assistant used by Claude Code.
+        Be concise, practical, and action-oriented.
+        Prefer short answers.
+        When relevant, give direct implementation steps, commands, code, or file edits.
+        Do not give long introductions or generic explanations.
+        If the user asks for code, provide the code first.
+        Prefer concrete next steps over brainstorming.
+        """.trimIndent()
+    )
+    sb.append("\n\n")
 
     if (!system.isNullOrBlank()) {
         sb.append("System:\n")
@@ -474,123 +492,9 @@ fun buildPrompt(system: String?, messages: List<ChatMessage>): String {
     return sb.toString()
 }
 
-fun isTitleRequest(modelName: String, system: String?, messages: List<ChatMessage>): Boolean {
-    val haystack = buildString {
-        append(system.orEmpty())
-        append("\n")
-        messages.forEach {
-            append(it.role)
-            append(": ")
-            append(it.content)
-            append("\n")
-        }
-    }.lowercase()
-
-    if (haystack.contains("generate a concise, sentence-case title")) return true
-    if (haystack.contains("return json with a single \"title\" field")) return true
-    if (haystack.contains("return json with a single 'title' field")) return true
-    if (haystack.contains("single \"title\" field")) return true
-    if (haystack.contains("single 'title' field")) return true
-    if (haystack.contains("session title")) return true
-
-    val onlyOneShortUserMessage =
-        messages.size == 1 &&
-            messages[0].role.equals("user", ignoreCase = true) &&
-            messages[0].content.length in 4..120 &&
-            !messages[0].content.contains('\n')
-
-    if (modelName.contains("haiku", ignoreCase = true) && onlyOneShortUserMessage) {
-        return true
-    }
-
-    return false
-}
-
-fun buildTitleJson(messages: List<ChatMessage>): String {
-    val source = messages
-        .asReversed()
-        .firstOrNull { it.role.equals("user", ignoreCase = true) }
-        ?.content
-        .orEmpty()
-
-    val cleaned = source
-        .replace(Regex("```[\\s\\S]*?```"), " ")
-        .replace(Regex("[\\r\\n]+"), " ")
-        .replace(Regex("[^\\p{L}\\p{N}\\s\\-]"), " ")
-        .replace(Regex("\\s+"), " ")
-        .trim()
-
-    val words = cleaned
-        .split(" ")
-        .filter { it.isNotBlank() }
-        .take(8)
-
-    val rawTitle = if (words.isEmpty()) "Nouvelle session" else words.joinToString(" ")
-    val title = rawTitle
-        .lowercase()
-        .replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
-
-    return """{"title":${jsonString(title)}}"""
-}
-
-fun sanitizeAssistantTurn(text: String): String {
-    var result = text.trim()
-
-    val stopMarkers = listOf(
-        "\nUser:\n",
-        "\nAssistant:\n",
-        "\nSystem:\n",
-        "\nUser:",
-        "\nAssistant:",
-        "\nSystem:"
-    )
-
-    for (marker in stopMarkers) {
-        val idx = result.indexOf(marker)
-        if (idx > 0) {
-            result = result.substring(0, idx).trimEnd()
-        }
-    }
-
-    result = result
-        .lines()
-        .filterNot { it.startsWith("VERBOSE:") }
-        .filterNot { it.startsWith("INFO:") }
-        .filterNot { it.startsWith("WARNING:") }
-        .takeWhile { !it.startsWith("BenchmarkInfo:") }
-        .joinToString("\n")
-        .trim()
-
-    return result
-}
-
-fun estimateTokenCount(text: String): Int {
-    if (text.isBlank()) return 0
-    return max(1, text.length / 4)
-}
-
-fun logRequestSummary(
-    modelName: String,
-    systemPrompt: String?,
-    messages: List<ChatMessage>,
-    maxTokens: Int,
-    temperature: Double
-) {
-    val preview = messages.joinToString(" | ") {
-        "${it.role}:${it.content.take(120).replace("\n", " ")}"
-    }
-
-    println(
-        "[REQ] model=$modelName max_tokens=$maxTokens temp=$temperature " +
-            "system=${systemPrompt?.take(120)?.replace("\n", " ") ?: "<none>"} " +
-            "messages=${messages.size} preview=$preview"
-    )
-}
-
-fun logResponseSummary(answer: String) {
-    val preview = answer.take(300).replace("\n", " ")
-    println("[RES] chars=${answer.length} preview=$preview")
-}
+// =========================
+// JSON / HTTP HELPERS
+// =========================
 
 fun sendJson(exchange: HttpExchange, statusCode: Int, body: String) {
     val bytes = body.toByteArray(Charsets.UTF_8)
