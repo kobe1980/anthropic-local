@@ -1,0 +1,1 @@
+kotlinc src/main/kotlin/Main.kt -J-Dlibrary.jansi.path=/data/data/com.termux/files/usr/lib/jansi -include-runtime -d server.jar
