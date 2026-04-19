@@ -1,6 +1,7 @@
 import java.io.File
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
-import kotlin.concurrent.thread
+import java.util.concurrent.TimeoutException
 
 interface LocalModel {
     fun isReady(): Boolean
@@ -28,8 +29,7 @@ class CliLocalModel(
             .redirectErrorStream(true)
             .apply {
                 val currentLd = environment()["LD_LIBRARY_PATH"].orEmpty()
-                environment()["LD_LIBRARY_PATH"] =
-                    if (currentLd.isBlank()) libDir else "$libDir:$currentLd"
+                environment()["LD_LIBRARY_PATH"] = if (currentLd.isBlank()) libDir else "$libDir:$currentLd"
             }
             .start()
 
@@ -62,6 +62,7 @@ class CliLocalModel(
         val output = outputCollector.toString()
         val exitCode = process.exitValue()
 
+        val exitCode = process.exitValue()
         if (exitCode != 0) {
             throw IllegalStateException("litert_lm_main failed with exit code $exitCode:\n$output")
         }
