@@ -43,11 +43,7 @@ class CliLocalModel(
         }
 
         val cleaned = extractModelAnswer(output)
-        return if (cleaned.length > MAX_RESPONSE_CHARS) {
-            cleaned.take(MAX_RESPONSE_CHARS)
-        } else {
-            cleaned
-        }
+        return truncateCleanly(cleaned, MAX_RESPONSE_CHARS)
     }
 
     private fun extractModelAnswer(rawOutput: String): String {
@@ -62,11 +58,41 @@ class CliLocalModel(
 
         return candidate
             .lines()
-            .takeWhile { !it.startsWith("BenchmarkInfo:") }
+            .takeWhile { line ->
+                !line.startsWith("BenchmarkInfo:") &&
+                    !line.startsWith("input_prompt:")
+            }
             .filterNot { it.startsWith("VERBOSE:") }
             .filterNot { it.startsWith("INFO:") }
             .filterNot { it.startsWith("WARNING:") }
+            .dropWhile { it.isBlank() }
             .joinToString("\n")
             .trim()
+    }
+
+    private fun truncateCleanly(text: String, maxChars: Int): String {
+        if (text.length <= maxChars) return text
+
+        val cut = text.take(maxChars)
+        val lastParagraph = cut.lastIndexOf("\n\n")
+        if (lastParagraph > maxChars / 2) {
+            return cut.substring(0, lastParagraph).trim()
+        }
+
+        val lastLine = cut.lastIndexOf('\n')
+        if (lastLine > maxChars / 2) {
+            return cut.substring(0, lastLine).trim()
+        }
+
+        val lastSentence = maxOf(
+            cut.lastIndexOf(". "),
+            cut.lastIndexOf("! "),
+            cut.lastIndexOf("? ")
+        )
+        if (lastSentence > maxChars / 2) {
+            return cut.substring(0, lastSentence + 1).trim()
+        }
+
+        return cut.trim()
     }
 }
