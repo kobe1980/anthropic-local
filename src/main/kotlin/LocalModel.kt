@@ -24,6 +24,7 @@ class CliLocalModel(
         check(isReady()) { "CLI model is not ready" }
 
         val command = buildCommand(prompt, maxTokens, temperature)
+
         val process = ProcessBuilder(command)
             .redirectErrorStream(true)
             .apply {
@@ -32,30 +33,34 @@ class CliLocalModel(
             }
             .start()
 
-        val outputExecutor = Executors.newSingleThreadExecutor()
-        val outputFuture = outputExecutor.submit<String> {
-            process.inputStream.bufferedReader().use { it.readText() }
+        val outputCollector = StringBuilder()
+        val readerThread = thread(start = true, isDaemon = true, name = "litert-output-reader") {
+            process.inputStream.bufferedReader().useLines { lines ->
+                lines.forEach { line ->
+                    outputCollector.appendLine(line)
+                }
+            }
         }
 
-        val finishedInTime = process.waitFor(generationTimeoutSeconds, TimeUnit.SECONDS)
-        if (!finishedInTime) {
+        val finished = process.waitFor(generationTimeoutSeconds, TimeUnit.SECONDS)
+        if (!finished) {
             process.destroy()
             if (!process.waitFor(2, TimeUnit.SECONDS)) {
                 process.destroyForcibly()
                 process.waitFor()
             }
-
-            val partialOutput = readOutputSafely(outputFuture)
-            outputExecutor.shutdownNow()
+            readerThread.join(2_000)
+            val output = outputCollector.toString().trim()
             throw IllegalStateException(
                 "litert_lm_main timed out after ${generationTimeoutSeconds}s. " +
                     "Try a smaller max_tokens or shorter prompt.\n" +
-                    partialOutput.takeLast(4_000)
+                    output.takeLast(4_000)
             )
         }
 
-        val output = readOutputSafely(outputFuture)
-        outputExecutor.shutdownNow()
+        readerThread.join(2_000)
+        val output = outputCollector.toString()
+        val exitCode = process.exitValue()
 
         val exitCode = process.exitValue()
         if (exitCode != 0) {
@@ -78,14 +83,6 @@ class CliLocalModel(
             "--temperature=$boundedTemperature",
             "--input_prompt=$prompt"
         )
-    }
-
-    private fun readOutputSafely(outputFuture: java.util.concurrent.Future<String>): String {
-        return try {
-            outputFuture.get(2, TimeUnit.SECONDS)
-        } catch (e: TimeoutException) {
-            ""
-        }
     }
 
     private fun extractModelAnswer(rawOutput: String): String {
