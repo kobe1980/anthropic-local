@@ -52,6 +52,24 @@ class LocalModelTest {
 
         assertEquals("nouvelle réponse utile", result)
     }
+
+    @Test
+    fun extractModelAnswer_removes_logs() {
+        val raw = """
+            Assistant:
+            INFO: init
+            VERBOSE: debug
+            WARNING: something
+            vraie réponse
+            BenchmarkInfo:
+            stats
+        """.trimIndent()
+
+        val model = CliLocalModelForTest()
+        val result = model.extract(raw)
+
+        assertEquals("vraie réponse", result)
+    }
 }
 
 private class CliLocalModelForTest {
@@ -67,10 +85,14 @@ private class CliLocalModelForTest {
 
         return candidate
             .lines()
-            .takeWhile { !it.startsWith("BenchmarkInfo:") }
+            .takeWhile { line ->
+                !line.startsWith("BenchmarkInfo:") &&
+                    !line.startsWith("input_prompt:")
+            }
             .filterNot { it.startsWith("VERBOSE:") }
             .filterNot { it.startsWith("INFO:") }
             .filterNot { it.startsWith("WARNING:") }
+            .dropWhile { it.isBlank() }
             .joinToString("\n")
             .trim()
     }
