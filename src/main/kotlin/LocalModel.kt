@@ -1,4 +1,6 @@
 import java.io.File
+import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
 
 interface LocalModel {
     fun isReady(): Boolean
@@ -9,7 +11,8 @@ class CliLocalModel(
     private val modelPath: String,
     private val binPath: String,
     private val libDir: String,
-    private val backend: String = "cpu"
+    private val backend: String = "cpu",
+    private val generationTimeoutSeconds: Long = 120
 ) : LocalModel {
 
     override fun isReady(): Boolean {
@@ -19,12 +22,7 @@ class CliLocalModel(
     override fun generate(prompt: String, maxTokens: Int, temperature: Double): String {
         check(isReady()) { "CLI model is not ready" }
 
-        val command = listOf(
-            binPath,
-            "--backend=$backend",
-            "--model_path=$modelPath",
-            "--input_prompt=$prompt"
-        )
+        val command = buildCommand(prompt, maxTokens, temperature)
 
         val process = ProcessBuilder(command)
             .redirectErrorStream(true)
@@ -35,8 +33,34 @@ class CliLocalModel(
             }
             .start()
 
-        val output = process.inputStream.bufferedReader().use { it.readText() }
-        val exitCode = process.waitFor()
+        val outputCollector = StringBuilder()
+        val readerThread = thread(start = true, isDaemon = true, name = "litert-output-reader") {
+            process.inputStream.bufferedReader().useLines { lines ->
+                lines.forEach { line ->
+                    outputCollector.appendLine(line)
+                }
+            }
+        }
+
+        val finished = process.waitFor(generationTimeoutSeconds, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (!process.waitFor(2, TimeUnit.SECONDS)) {
+                process.destroyForcibly()
+                process.waitFor()
+            }
+            readerThread.join(2_000)
+            val output = outputCollector.toString().trim()
+            throw IllegalStateException(
+                "litert_lm_main timed out after ${generationTimeoutSeconds}s. " +
+                    "Try a smaller max_tokens or shorter prompt.\n" +
+                    output.takeLast(4_000)
+            )
+        }
+
+        readerThread.join(2_000)
+        val output = outputCollector.toString()
+        val exitCode = process.exitValue()
 
         if (exitCode != 0) {
             throw IllegalStateException("litert_lm_main failed with exit code $exitCode:\n$output")
@@ -44,6 +68,20 @@ class CliLocalModel(
 
         val cleaned = extractModelAnswer(output)
         return truncateCleanly(cleaned, MAX_RESPONSE_CHARS)
+    }
+
+    internal fun buildCommand(prompt: String, maxTokens: Int, temperature: Double): List<String> {
+        val boundedMaxTokens = maxTokens.coerceIn(1, 1024)
+        val boundedTemperature = temperature.coerceIn(0.0, 2.0)
+
+        return listOf(
+            binPath,
+            "--backend=$backend",
+            "--model_path=$modelPath",
+            "--max_output_tokens=$boundedMaxTokens",
+            "--temperature=$boundedTemperature",
+            "--input_prompt=$prompt"
+        )
     }
 
     private fun extractModelAnswer(rawOutput: String): String {
