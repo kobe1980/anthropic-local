@@ -1,7 +1,6 @@
 import java.io.File
-import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.TimeoutException
+import kotlin.concurrent.thread
 
 interface LocalModel {
     fun isReady(): Boolean
@@ -60,8 +59,6 @@ class CliLocalModel(
 
         readerThread.join(2_000)
         val output = outputCollector.toString()
-        val exitCode = process.exitValue()
-
         val exitCode = process.exitValue()
         if (exitCode != 0) {
             throw IllegalStateException("litert_lm_main failed with exit code $exitCode:\n$output")
