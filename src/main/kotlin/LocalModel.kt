@@ -76,8 +76,6 @@ class CliLocalModel(
             binPath,
             "--backend=$backend",
             "--model_path=$modelPath",
-            "--max_output_tokens=$boundedMaxTokens",
-            "--temperature=$boundedTemperature",
             "--input_prompt=$prompt"
         )
     }
