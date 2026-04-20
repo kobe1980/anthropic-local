@@ -78,16 +78,26 @@ private fun handleMessages(exchange: HttpExchange, model: LocalModel, debug: Boo
     }
 
     try {
-        val system = extractTopLevelString(requestBody, "system")
+        val requestedModel = extractTopLevelString(requestBody, "model")
+        val rawSystem = extractSystemText(requestBody)
+        val outputFormatInstruction = extractOutputFormatInstruction(requestBody)
+        val effectiveSystem = listOfNotNull(
+            rawSystem?.takeIf { it.isNotBlank() },
+            outputFormatInstruction?.takeIf { it.isNotBlank() }
+        ).joinToString("\n\n").takeIf { it.isNotBlank() }
+
         val messages = extractMessages(requestBody)
         val maxTokens = extractTopLevelInt(requestBody, "max_tokens") ?: 512
         val temperature = extractTopLevelDouble(requestBody, "temperature") ?: 0.2
 
-        val prompt = buildPrompt(system, messages)
+        val prompt = buildPrompt(effectiveSystem, messages)
 
         if (debug) {
             println("[${timestamp()}] [http] parsed request:")
-            println("  system length=${system?.length ?: 0}")
+            println("  model=${requestedModel ?: ""}")
+            println("  raw system length=${rawSystem?.length ?: 0}")
+            println("  output format instruction length=${outputFormatInstruction?.length ?: 0}")
+            println("  effective system length=${effectiveSystem?.length ?: 0}")
             println("  messages count=${messages.size}")
             println("  max_tokens=$maxTokens")
             println("  temperature=$temperature")
@@ -203,7 +213,10 @@ private fun logRequest(exchange: HttpExchange, body: String?) {
 
 private fun printHeaders(headers: Headers) {
     for ((key, values) in headers) {
-        val renderedValue = if (key.equals("x-api-key", ignoreCase = true)) {
+        val renderedValue = if (
+            key.equals("x-api-key", ignoreCase = true) ||
+            key.equals("authorization", ignoreCase = true)
+        ) {
             "***redacted***"
         } else {
             values.joinToString(", ")

@@ -22,29 +22,33 @@ fun extractMessages(json: String): List<ChatMessage> {
     return result
 }
 
+fun extractSystemText(json: String): String? {
+    val valueStart = findValueStart(json, "system") ?: return null
+    return extractTextLikeValue(json, valueStart)
+}
+
+fun extractOutputFormatInstruction(json: String): String? {
+    val outputConfigPos = json.indexOf("\"output_config\"")
+    if (outputConfigPos == -1) return null
+
+    val formatPos = json.indexOf("\"format\"", outputConfigPos)
+    if (formatPos == -1) return null
+
+    val schemaJson = extractObjectForKey(json, "schema", formatPos) ?: return null
+
+    return """
+        Output requirement:
+        Return valid JSON only.
+        Match exactly this JSON schema:
+        $schemaJson
+        Do not wrap the JSON in markdown fences.
+        Do not add explanation before or after the JSON.
+    """.trimIndent()
+}
+
 fun extractContentField(messageObject: String): String {
-    val contentPos = messageObject.indexOf("\"content\"")
-    if (contentPos == -1) return ""
-
-    val colon = messageObject.indexOf(':', contentPos)
-    if (colon == -1) return ""
-
-    var i = colon + 1
-    while (i < messageObject.length && messageObject[i].isWhitespace()) i++
-
-    if (i >= messageObject.length) return ""
-
-    return when (messageObject[i]) {
-        '"' -> {
-            val end = findStringEnd(messageObject, i)
-            if (end == -1) "" else unescapeJson(messageObject.substring(i + 1, end))
-        }
-        '[' -> {
-            val end = findMatchingBracket(messageObject, i, '[', ']')
-            if (end == -1) "" else extractTextBlocksFromContentArray(messageObject.substring(i, end + 1))
-        }
-        else -> ""
-    }
+    val valueStart = findValueStart(messageObject, "content") ?: return ""
+    return extractTextLikeValue(messageObject, valueStart).orEmpty()
 }
 
 fun extractTextBlocksFromContentArray(arrayJson: String): String {
@@ -63,21 +67,13 @@ fun extractTextBlocksFromContentArray(arrayJson: String): String {
 }
 
 fun extractTopLevelString(json: String, key: String): String? {
-    val pattern = "\"$key\""
-    val keyIndex = json.indexOf(pattern)
-    if (keyIndex == -1) return null
+    val valueStart = findValueStart(json, key) ?: return null
+    if (valueStart >= json.length || json[valueStart] != '"') return null
 
-    val colonIndex = json.indexOf(':', keyIndex + pattern.length)
-    if (colonIndex == -1) return null
-
-    var i = colonIndex + 1
-    while (i < json.length && json[i].isWhitespace()) i++
-    if (i >= json.length || json[i] != '"') return null
-
-    val end = findStringEnd(json, i)
+    val end = findStringEnd(json, valueStart)
     if (end == -1) return null
 
-    return unescapeJson(json.substring(i + 1, end))
+    return unescapeJson(json.substring(valueStart + 1, end))
 }
 
 fun extractTopLevelInt(json: String, key: String): Int? {
@@ -89,18 +85,11 @@ fun extractTopLevelDouble(json: String, key: String): Double? {
 }
 
 fun extractTopLevelPrimitive(json: String, key: String): String? {
-    val pattern = "\"$key\""
-    val keyIndex = json.indexOf(pattern)
-    if (keyIndex == -1) return null
+    val valueStart = findValueStart(json, key) ?: return null
+    if (valueStart >= json.length) return null
 
-    val colonIndex = json.indexOf(':', keyIndex + pattern.length)
-    if (colonIndex == -1) return null
-
-    var i = colonIndex + 1
-    while (i < json.length && json[i].isWhitespace()) i++
-    if (i >= json.length) return null
-
-    val start = i
+    val start = valueStart
+    var i = start
     while (i < json.length && json[i] !in charArrayOf(',', '}', '\n', '\r')) i++
 
     return json.substring(start, i).trim().removeSuffix(",")
@@ -200,4 +189,45 @@ fun unescapeJson(input: String): String {
         }
     }
     return sb.toString()
+}
+
+private fun extractTextLikeValue(json: String, valueStart: Int): String? {
+    if (valueStart >= json.length) return null
+
+    return when (json[valueStart]) {
+        '"' -> {
+            val end = findStringEnd(json, valueStart)
+            if (end == -1) null else unescapeJson(json.substring(valueStart + 1, end))
+        }
+        '[' -> {
+            val end = findMatchingBracket(json, valueStart, '[', ']')
+            if (end == -1) null else extractTextBlocksFromContentArray(json.substring(valueStart, end + 1))
+        }
+        else -> null
+    }
+}
+
+private fun findValueStart(json: String, key: String, searchFrom: Int = 0): Int? {
+    val pattern = "\"$key\""
+    val keyIndex = json.indexOf(pattern, searchFrom)
+    if (keyIndex == -1) return null
+
+    val colonIndex = json.indexOf(':', keyIndex + pattern.length)
+    if (colonIndex == -1) return null
+
+    var i = colonIndex + 1
+    while (i < json.length && json[i].isWhitespace()) i++
+    if (i >= json.length) return null
+
+    return i
+}
+
+private fun extractObjectForKey(json: String, key: String, searchFrom: Int = 0): String? {
+    val valueStart = findValueStart(json, key, searchFrom) ?: return null
+    if (valueStart >= json.length || json[valueStart] != '{') return null
+
+    val end = findMatchingBracket(json, valueStart, '{', '}')
+    if (end == -1) return null
+
+    return json.substring(valueStart, end + 1)
 }
