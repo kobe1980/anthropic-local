@@ -1,3 +1,8 @@
+private val systemReminderRegex = Regex(
+    pattern = "<system-reminder>[\\s\\S]*?</system-reminder>",
+    options = setOf(RegexOption.IGNORE_CASE)
+)
+
 fun extractMessages(json: String): List<ChatMessage> {
     val result = mutableListOf<ChatMessage>()
 
@@ -14,9 +19,18 @@ fun extractMessages(json: String): List<ChatMessage> {
 
     val objects = splitTopLevelObjects(arrayBody)
     for (obj in objects) {
-        val role = extractTopLevelString(obj, "role") ?: "user"
-        val content = extractContentField(obj)
-        result += ChatMessage(role = role, content = content)
+        val role = (extractTopLevelString(obj, "role") ?: "user").lowercase()
+        val content = normalizeMessageContent(extractContentField(obj))
+        if (content.isBlank()) continue
+        if (role == "assistant" && isTransportErrorMessage(content)) continue
+
+        val candidate = ChatMessage(role = role, content = content)
+        val previous = result.lastOrNull()
+        if (previous != null && previous.role == candidate.role && previous.content == candidate.content) {
+            continue
+        }
+
+        result += candidate
     }
 
     return result
@@ -24,7 +38,8 @@ fun extractMessages(json: String): List<ChatMessage> {
 
 fun extractSystemText(json: String): String? {
     val valueStart = findValueStart(json, "system") ?: return null
-    return extractTextLikeValue(json, valueStart)
+    val raw = extractTextLikeValue(json, valueStart) ?: return null
+    return normalizeSystemText(raw).ifBlank { null }
 }
 
 fun extractOutputFormatInstruction(json: String): String? {
@@ -33,6 +48,9 @@ fun extractOutputFormatInstruction(json: String): String? {
 
     val formatPos = json.indexOf("\"format\"", outputConfigPos)
     if (formatPos == -1) return null
+
+    val formatType = extractTopLevelString(json.substring(formatPos), "type")
+    if (formatType != null && formatType != "json_schema") return null
 
     val schemaJson = extractObjectForKey(json, "schema", formatPos) ?: return null
 
@@ -57,10 +75,14 @@ fun extractTextBlocksFromContentArray(arrayJson: String): String {
 
     for (obj in objects) {
         val type = extractTopLevelString(obj, "type")
-        if (type == "text") {
-            val text = extractTopLevelString(obj, "text")
-            if (!text.isNullOrBlank()) texts += text
-        }
+        if (type != "text") continue
+
+        val text = extractTopLevelString(obj, "text").orEmpty()
+        val cleaned = normalizeMessageContent(text)
+        if (cleaned.isBlank()) continue
+        if (texts.lastOrNull() == cleaned) continue
+
+        texts += cleaned
     }
 
     return texts.joinToString("\n")
@@ -230,4 +252,24 @@ private fun extractObjectForKey(json: String, key: String, searchFrom: Int = 0):
     if (end == -1) return null
 
     return json.substring(valueStart, end + 1)
+}
+
+private fun normalizeMessageContent(input: String): String {
+    return input
+        .replace(systemReminderRegex, "")
+        .replace(Regex("\n{3,}"), "\n\n")
+        .trim()
+}
+
+private fun normalizeSystemText(input: String): String {
+    return input
+        .replace(Regex("(?m)^x-anthropic-billing-header:.*$"), "")
+        .replace(Regex("\n{3,}"), "\n\n")
+        .trim()
+}
+
+private fun isTransportErrorMessage(text: String): Boolean {
+    val trimmed = text.trim()
+    return trimmed.startsWith("Error: INVALID_ARGUMENT: Input token ids are too long") ||
+        trimmed.contains("Cannot read properties of undefined (reading 'input_tokens')")
 }

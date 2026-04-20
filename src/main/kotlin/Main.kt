@@ -4,6 +4,7 @@ import com.sun.net.httpserver.HttpHandler
 import com.sun.net.httpserver.HttpServer
 import java.net.InetSocketAddress
 import java.time.Instant
+import kotlin.math.ceil
 
 fun main(args: Array<String>) {
     val debug = args.contains("--debug")
@@ -78,7 +79,7 @@ private fun handleMessages(exchange: HttpExchange, model: LocalModel, debug: Boo
     }
 
     try {
-        val requestedModel = extractTopLevelString(requestBody, "model")
+        val requestedModel = extractTopLevelString(requestBody, "model") ?: "local-lite"
         val rawSystem = extractSystemText(requestBody)
         val outputFormatInstruction = extractOutputFormatInstruction(requestBody)
         val effectiveSystem = listOfNotNull(
@@ -87,20 +88,31 @@ private fun handleMessages(exchange: HttpExchange, model: LocalModel, debug: Boo
         ).joinToString("\n\n").takeIf { it.isNotBlank() }
 
         val messages = extractMessages(requestBody)
+        if (messages.isEmpty()) {
+            sendAnthropicError(
+                exchange = exchange,
+                statusCode = 400,
+                errorType = "invalid_request_error",
+                message = "No usable message content found in request.",
+                debug = debug
+            )
+            return
+        }
+
         val maxTokens = extractTopLevelInt(requestBody, "max_tokens") ?: 512
         val temperature = extractTopLevelDouble(requestBody, "temperature") ?: 0.2
-
         val prompt = buildPrompt(effectiveSystem, messages)
 
         if (debug) {
             println("[${timestamp()}] [http] parsed request:")
-            println("  model=${requestedModel ?: ""}")
+            println("  model=$requestedModel")
             println("  raw system length=${rawSystem?.length ?: 0}")
             println("  output format instruction length=${outputFormatInstruction?.length ?: 0}")
             println("  effective system length=${effectiveSystem?.length ?: 0}")
             println("  messages count=${messages.size}")
             println("  max_tokens=$maxTokens")
             println("  temperature=$temperature")
+            println("  prompt chars=${prompt.length}")
             println("[${timestamp()}] [litert] prompt:")
             println(prompt)
         }
@@ -111,16 +123,28 @@ private fun handleMessages(exchange: HttpExchange, model: LocalModel, debug: Boo
             temperature = temperature
         )
 
+        val inputTokens = estimateTokens(prompt)
+        val outputTokens = estimateTokens(answer)
+        val responseId = "msg_${System.currentTimeMillis()}"
+
         val response = """
             {
+              "id": ${jsonString(responseId)},
               "type": "message",
               "role": "assistant",
+              "model": ${jsonString(requestedModel)},
               "content": [
                 {
                   "type": "text",
                   "text": ${jsonString(answer)}
                 }
-              ]
+              ],
+              "stop_reason": "end_turn",
+              "stop_sequence": null,
+              "usage": {
+                "input_tokens": $inputTokens,
+                "output_tokens": $outputTokens
+              }
             }
         """.trimIndent()
 
@@ -130,26 +154,49 @@ private fun handleMessages(exchange: HttpExchange, model: LocalModel, debug: Boo
         }
 
         sendJson(exchange, 200, response)
+    } catch (e: IllegalArgumentException) {
+        sendAnthropicError(
+            exchange = exchange,
+            statusCode = 400,
+            errorType = "invalid_request_error",
+            message = e.message ?: "invalid request",
+            debug = debug
+        )
     } catch (e: Exception) {
         e.printStackTrace()
-
-        val errorResponse = """
-            {
-              "type": "error",
-              "error": {
-                "type": "api_error",
-                "message": ${jsonString(e.message ?: "unknown")}
-              }
-            }
-        """.trimIndent()
-
-        if (debug) {
-            println("[${timestamp()}] [http] error response /v1/messages:")
-            println(errorResponse)
-        }
-
-        sendJson(exchange, 500, errorResponse)
+        sendAnthropicError(
+            exchange = exchange,
+            statusCode = 500,
+            errorType = "api_error",
+            message = e.message ?: "unknown",
+            debug = debug
+        )
     }
+}
+
+private fun sendAnthropicError(
+    exchange: HttpExchange,
+    statusCode: Int,
+    errorType: String,
+    message: String,
+    debug: Boolean
+) {
+    val body = """
+        {
+          "type": "error",
+          "error": {
+            "type": ${jsonString(errorType)},
+            "message": ${jsonString(message)}
+          }
+        }
+    """.trimIndent()
+
+    if (debug) {
+        println("[${timestamp()}] [http] error response /v1/messages:")
+        println(body)
+    }
+
+    sendJson(exchange, statusCode, body)
 }
 
 private class DebugLocalModel(
@@ -195,6 +242,11 @@ private class DebugLocalModel(
 
         return answer
     }
+}
+
+private fun estimateTokens(text: String): Int {
+    if (text.isBlank()) return 1
+    return ceil(text.length / 4.0).toInt().coerceAtLeast(1)
 }
 
 private fun logRequest(exchange: HttpExchange, body: String?) {
